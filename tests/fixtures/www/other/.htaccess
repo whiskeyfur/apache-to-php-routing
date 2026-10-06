@@ -1,0 +1,2 @@
+RewriteEngine On
+RewriteRule ^pretty/([a-z]+)$ page.php?name=$1 [QSA,L]
