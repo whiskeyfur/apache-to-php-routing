@@ -1,0 +1,205 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+namespace Apache2Router;
+
+foreach (['PathMapper', 'ConfigParser', 'Rewrite', 'Router', 'Compiler', 'Generator'] as $class) {
+    require_once __DIR__ . '/../src/' . $class . '.php';
+}
+
+const VERSION = '0.1.0';
+
+$usage = <<<'TXT'
+Usage: apache2router [options] <apache.conf> [<more.conf> ...]
+
+Reads Apache configuration files and writes a router.php for PHP's built-in
+server (php -S). The files are read in order, as if concatenated; Include
+directives are followed.
+
+Options:
+  -o, --output FILE        Where to write the router (default: router.php; "-" for stdout)
+  -m, --map OLD=NEW        Treat paths under OLD (as written in the config) as living
+                           under NEW now. Repeatable; longest OLD wins.
+                           e.g. --map /var/www=~/sites --map C:/xampp=/opt/xampp
+  -r, --server-root DIR    Where the config's ServerRoot lives now (relative Include,
+                           DocumentRoot and similar paths resolve against it)
+  -D, --define NAME[=VAL]  Define a parameter, like httpd -D (for <IfDefine> and ${NAME})
+      --default-host NAME  Virtual host to use when the Host header matches none
+                           (default: the first one, as Apache does)
+      --htaccess MODE      auto (follow AllowOverride; default), always, or never
+      --proxy-status CODE  HTTP status of the page shown for proxied URLs (default 502)
+      --keep-redirects     Leave redirects to https:// and to our own host names alone
+                           (by default they are pointed back at php -S over http)
+  -q, --quiet              Don't print warnings
+  -h, --help               Show this help
+  -V, --version            Show the version
+
+Then run:  php -S 127.0.0.1:8080 router.php
+
+TXT;
+
+$argvList = array_slice($argv, 1);
+$opts = [
+    'output' => 'router.php', 'maps' => [], 'server_root' => null, 'defines' => [],
+    'default_host' => null, 'htaccess' => 'auto', 'proxy_status' => 502, 'keep_redirects' => false, 'quiet' => false,
+];
+$files = [];
+
+$fail = static function (string $msg) use ($usage): never {
+    fwrite(STDERR, "apache2router: $msg\n\n" . $usage);
+    exit(2);
+};
+$expandHome = static function (string $p): string {
+    if (str_starts_with($p, '~/') || $p === '~') {
+        $home = getenv('HOME') ?: getenv('USERPROFILE') ?: '';
+        return $home . substr($p, 1);
+    }
+    return $p;
+};
+$absolute = static function (string $p) use ($expandHome): string {
+    $p = $expandHome($p);
+    $real = realpath($p);
+    if ($real !== false) {
+        return PathMapper::normalize($real);
+    }
+    return PathMapper::isAbsolute($p) ? PathMapper::normalize($p) : PathMapper::join((string) getcwd(), $p);
+};
+
+for ($i = 0; $i < count($argvList); $i++) {
+    $arg = $argvList[$i];
+    $value = null;
+    if (str_starts_with($arg, '--') && str_contains($arg, '=')) {
+        [$arg, $value] = explode('=', $arg, 2);
+    }
+    $next = static function () use (&$i, $argvList, $arg, &$value, $fail): string {
+        if ($value !== null) {
+            return $value;
+        }
+        if (!isset($argvList[$i + 1])) {
+            $fail("$arg needs a value");
+        }
+        return $argvList[++$i];
+    };
+    switch ($arg) {
+        case '-h':
+        case '--help':
+            echo $usage;
+            exit(0);
+        case '-V':
+        case '--version':
+            echo 'apache2router ' . VERSION . "\n";
+            exit(0);
+        case '-o':
+        case '--output':
+            $opts['output'] = $next();
+            break;
+        case '-m':
+        case '--map':
+            $m = $next();
+            $eq = strpos($m, '=');
+            if ($eq === false || $eq === 0) {
+                $fail("--map expects OLD=NEW, got \"$m\"");
+            }
+            $opts['maps'][] = [substr($m, 0, $eq), $absolute(substr($m, $eq + 1))];
+            break;
+        case '-r':
+        case '--server-root':
+            $opts['server_root'] = $absolute($next());
+            break;
+        case '-D':
+        case '--define':
+            $d = $next();
+            $eq = strpos($d, '=');
+            $opts['defines'][$eq === false ? $d : substr($d, 0, $eq)] = $eq === false ? '' : substr($d, $eq + 1);
+            break;
+        case '--default-host':
+            $opts['default_host'] = $next();
+            break;
+        case '--htaccess':
+            $opts['htaccess'] = strtolower($next());
+            if (!in_array($opts['htaccess'], ['auto', 'always', 'never'], true)) {
+                $fail('--htaccess must be auto, always or never');
+            }
+            break;
+        case '--proxy-status':
+            $code = $next();
+            if (!ctype_digit($code) || (int) $code < 100 || (int) $code > 599) {
+                $fail('--proxy-status must be an HTTP status code');
+            }
+            $opts['proxy_status'] = (int) $code;
+            break;
+        case '--keep-redirects':
+            $opts['keep_redirects'] = true;
+            break;
+        case '-q':
+        case '--quiet':
+            $opts['quiet'] = true;
+            break;
+        default:
+            if (str_starts_with($arg, '-D') && strlen($arg) > 2) {
+                $d = substr($arg, 2);
+                $eq = strpos($d, '=');
+                $opts['defines'][$eq === false ? $d : substr($d, 0, $eq)] = $eq === false ? '' : substr($d, $eq + 1);
+                break;
+            }
+            if (str_starts_with($arg, '-') && $arg !== '-') {
+                $fail("unknown option $arg");
+            }
+            $files[] = $arg;
+    }
+}
+
+if ($files === []) {
+    $fail('no config files given');
+}
+foreach ($files as $k => $f) {
+    if (!is_file($f)) {
+        $fail("cannot read $f");
+    }
+    $files[$k] = $absolute($f);
+}
+
+$mapper = new PathMapper($opts['maps']);
+$parser = new ConfigParser($mapper);
+$parser->defines = $opts['defines'];
+$parser->serverRootOverride = $opts['server_root'];
+$parser->initServerRoot($files[0]);
+
+$nodes = [];
+foreach ($files as $f) {
+    foreach ($parser->parseFile($f) as $node) {
+        $nodes[] = $node;
+    }
+}
+
+$compiler = new Compiler($parser, $mapper, [
+    'default_host' => $opts['default_host'],
+    'htaccess' => $opts['htaccess'],
+    'proxy_status' => $opts['proxy_status'],
+    'keep_redirects' => $opts['keep_redirects'],
+]);
+$config = $compiler->compile($nodes);
+$warnings = array_values(array_unique(array_merge($parser->warnings, $compiler->warnings)));
+
+$router = Generator::render($config, $parser->sources, $warnings);
+
+if ($opts['output'] === '-') {
+    echo $router;
+} else {
+    if (@file_put_contents($opts['output'], $router) === false) {
+        fwrite(STDERR, "apache2router: cannot write {$opts['output']}\n");
+        exit(1);
+    }
+    $count = count($config['vhosts']);
+    fwrite(STDERR, "Wrote {$opts['output']} ($count virtual host" . ($count === 1 ? '' : 's') . ").\n");
+    fwrite(STDERR, 'Run: php -S 127.0.0.1:8080 ' . $opts['output'] . "\n");
+}
+if (!$opts['quiet'] && $warnings !== []) {
+    fwrite(STDERR, "\nWarnings:\n");
+    foreach ($warnings as $w) {
+        fwrite(STDERR, "  - $w\n");
+    }
+}
+exit(0);
